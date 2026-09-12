@@ -123,6 +123,11 @@ NVFP4 decode speed and materially better prefill, instead of not at all.
 For scale, the owner's `llama.cpp` on a comparable Q4_K_M with `--n-cpu-moe 20..23` does
 ~52–55 tok/s decode on the same box.
 
+**How it got from 27.4 to here — and the twenty-odd levers that paid nothing — is in
+[docs/gguf-performance.md](docs/gguf-performance.md).** That file is the reason to read
+this fork rather than just apply the diff: the token budget, the tuned constants and why
+those values, the measurement traps that made early numbers lie, and the measured ceiling.
+
 ### Hardware
 
 * GPU: **NVIDIA RTX 3060, 12 GB** (11.63 GiB usable), SM 8.6
@@ -170,7 +175,8 @@ model that does not fit, and every number above is a 12 GB-GPU number.
 * **Multi-GPU / tensor parallel.** Single-GPU only.
 * **Any architecture other than `qwen35moe`.** The adapter is model-specific; the kernel
   and tokenizer fixes are not.
-* **`_prefill_routed`'s chunk cost** — see limitations.
+* **`_prefill_routed`'s chunk cost** — see limitations and
+  [docs/gguf-performance.md](docs/gguf-performance.md#6-the-ceiling-and-what-is-left).
 
 ---
 

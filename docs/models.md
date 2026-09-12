@@ -33,7 +33,8 @@ is preserved. Point `--model` at the `.gguf` **file** rather than a directory.
   fork adds are what make it reachable for GGUF at all.
 - Known-good: [peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF](https://huggingface.co/peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF)
   (`UD-Q4_K_M`) and a Qwen3.6-35B-A3B `Q4_K_M`. See
-  [README-fork.md](../README-fork.md) for measured numbers and the flags that matter.
+  [README-fork.md](../README-fork.md) for measured numbers and the flags that matter, and
+  [gguf-performance.md](gguf-performance.md) for how those flags were chosen.
 
 ## MoE backends
 
