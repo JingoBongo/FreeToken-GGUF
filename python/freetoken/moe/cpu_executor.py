@@ -68,7 +68,10 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {
+    "bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
+    "gguf_k": 5,  # FT-CPU-KQUANT-WFMT: native GGUF K-quants, ggml type per layer
+}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -192,6 +195,10 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        # FT-CPU-KQUANT-CACHEREF: gguf_k's geometry (H/I + the per-layer ggml types)
+        # is not recoverable from the flat bank shapes; _resolve_gguf_k_banks reads it
+        # off the cache.
+        self._cache = cache
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
@@ -238,6 +245,21 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        if fmt == "gguf_k":  # FT-CPU-KQUANT-SETLAYOUT
+            # Per-layer ggml types + the bank's per-expert byte stride. Must land
+            # before the first task; there is no default that could be silently wrong.
+            if not hasattr(self._ext, "set_gguf_k_layout"):
+                raise RuntimeError(
+                    "the compiled _cpu_moe extension predates GGUF K-quant experts; "
+                    "rebuild it (perf-tools/cpumoe_build.py --install) before serving "
+                    "this model on the cpu/hybrid backend"
+                )
+            self._ext.set_gguf_k_layout(
+                gate_up_types=self._gguf_k_gate_up_types,
+                down_types=self._gguf_k_down_types,
+                gate_up_expert_bytes=self._gguf_k_gu_expert_bytes,
+                down_expert_bytes=self._gguf_k_dn_expert_bytes,
+            )
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
@@ -367,6 +389,9 @@ class CpuMoeExecutor:
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
 
+        if fmt == "gguf_k":  # FT-CPU-KQUANT-RESOLVE
+            return self._resolve_gguf_k_banks(banks)
+
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
 
@@ -414,6 +439,46 @@ class CpuMoeExecutor:
         assert H % 32 == 0 and I % 32 == 0, (H, I)
         assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
         assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gate_up).data_ptr(),
+            down_ptr=self._make_table(down).data_ptr(),
+            gate_up_scale_ptr=0,
+            gate_up_global_ptr=0,
+            down_scale_ptr=0,
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_gguf_k_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """Native GGUF K-quant schema: the raw ggml block bytes of the GGUF tensors.
+
+        FT-CPU-KQUANT-BANKS. ``gate_up`` is ``[E, gu_bytes, 1]`` per layer and ``down``
+        ``[E, dn_bytes, 1]`` -- FLAT per-expert regions, because the ggml type (and so
+        the packed row width) varies per LAYER while the offload cache needs one bank
+        shape for all of them, so each layer writes its own rows contiguously from the
+        start of its region and the surplus sits unread in the tail (see
+        ``qwen3_5_moe.gguf._bank_geometry``). Neither H/I nor the per-layer types are
+        recoverable from those shapes, so they ride on the cache as ``gguf_k_meta``
+        (set by the engine from the model config).
+        """
+        meta = getattr(self._cache, "gguf_k_meta", None)
+        if not meta:
+            raise RuntimeError(
+                "gguf_k CPU MoE: the offload cache carries no gguf_k_meta "
+                "(hidden/inter sizes + per-layer ggml types); the engine sets it "
+                "when it builds the cache"
+            )
+        gate_up, down = banks["gate_up"], banks["down"]
+        assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
+            gate_up[0].dtype, down[0].dtype,
+        )
+        H, I = int(meta["hidden"]), int(meta["inter"])
+        self._gguf_k_gate_up_types = [int(t) for t in meta["gate_up_types"]]
+        self._gguf_k_down_types = [int(t) for t in meta["down_types"]]
+        self._gguf_k_gu_expert_bytes = int(gate_up[0][0].numel())
+        self._gguf_k_dn_expert_bytes = int(down[0][0].numel())
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),

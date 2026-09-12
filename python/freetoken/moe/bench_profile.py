@@ -28,6 +28,11 @@ _QUANT_TO_BENCH_FORMAT = {
     "mxfp4": "mxfp4_triton",
     "bf16": "bf16",
     "fp8_block": "fp8_block",
+    # FT-CPU-KQUANT-BENCHMAP: native GGUF experts. Both names already fall through
+    # unmapped (the .get default is the key itself); listed so the supported set is
+    # readable here rather than implied.
+    "q4_0": "q4_0",
+    "gguf_k": "gguf_k",
 }
 
 

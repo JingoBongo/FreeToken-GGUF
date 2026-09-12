@@ -55,9 +55,13 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+# FT-CPU-KQUANT-FORMATSETS: gguf_k joins both sets (the C++ kernel now has the
+# K-quant dots, and _cpu_moe_bank_sources/_offload_bank_specs build its banks).
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "gguf_k"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
-_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+_BUILDABLE_FORMATS = frozenset(
+    {"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4", "gguf_k"}
+)
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -131,6 +135,10 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    # FT-CPU-KQUANT-DTYPEWL: native GGUF K-quant experts. Geometry is the
+    # Qwen3.5/3.6-35B-A3B family every GGUF of this class ships (H 2048, I 512,
+    # 256 experts, top-8) -- the per-expert byte size is what the bandwidths ride on.
+    "gguf_k": Workload("dtype:gguf_k", 2048, 512, 256, 8, ("gguf_k",)),
 }
 
 
@@ -270,6 +278,31 @@ def measure_pcie_bw(device: torch.device, nbytes: int = 256 << 20, iters: int = 
 # ============================== bank geometry ==============================
 
 
+# FT-CPU-KQUANT-BENCHTYPES. A gguf_k checkpoint mixes ggml types across layers, but a
+# synthetic single-layer bench has to pick one (gate_up, down) pair. The default is
+# the dominant one on this class of Unsloth-Dynamic Q4_K_M quants -- Q4_K gate_up,
+# Q5_K down (37 of 40 layers here; the other 3 are Q6_K, ~19% more bytes per down
+# row). FREETOKEN_BENCHBW_GGUF_K_TYPES="12,14" overrides it.
+_GGUF_K_BLOCK_BYTES = {12: 144, 13: 176, 14: 210}  # Q4_K, Q5_K, Q6_K per 256 weights
+
+
+def _gguf_k_bench_types() -> tuple[int, int]:
+    raw = os.environ.get("FREETOKEN_BENCHBW_GGUF_K_TYPES", "12,13")
+    gu, dn = (int(v) for v in raw.split(","))
+    for t in (gu, dn):
+        if t not in _GGUF_K_BLOCK_BYTES:
+            raise ValueError(f"unsupported gguf_k bench ggml type {t}")
+    return gu, dn
+
+
+_GGUF_K_BENCH_TYPES = _gguf_k_bench_types()
+
+
+def _gguf_k_row_bytes(K: int, ggml_type: int) -> int:
+    assert K % 256 == 0, K
+    return (K // 256) * _GGUF_K_BLOCK_BYTES[ggml_type]
+
+
 def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) for the flat offload host banks (the gather)."""
     u8, bf16, f16, f8 = torch.uint8, torch.bfloat16, torch.float16, torch.float8_e4m3fn
@@ -285,6 +318,11 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 16), u8),
             "gate_up_global": (2 * I, f16), "down_packed": (H * (I // 2), u8),
             "down_scale": (H * (I // 16), u8), "down_global": (H, f16),
+        }
+    if fmt == "gguf_k":  # FT-CPU-KQUANT-SPECS
+        return {
+            "gate_up": (2 * I * _gguf_k_row_bytes(H, _GGUF_K_BENCH_TYPES[0]), u8),
+            "down": (H * _gguf_k_row_bytes(I, _GGUF_K_BENCH_TYPES[1]), u8),
         }
     if fmt == "mxfp4_triton":
         return {
@@ -310,6 +348,24 @@ def _synth_experts(E: int, expert_bytes: int) -> int:
     (2 GiB) far exceeds any LLC, so the working set stays DRAM-sized whenever E is large; for
     huge-expert models each expert already exceeds the LLC, so a handful still defeats it."""
     return min(E, max(1, _SYNTH_BANK_BUDGET // max(1, expert_bytes)))
+
+
+def _gguf_k_fix_scales(bank: torch.Tensor, rows: int, row_bytes: int, ggml_type: int) -> None:
+    """FT-CPU-KQUANT-FIXSCALES: force every block's fp16 super-block scale(s) to 1.0.
+
+    Random bytes would put many of them in the fp16 denormal/NaN range; the dot
+    multiplies by them in fp32, and NaNs/denormals both distort a bandwidth number.
+    Q4_K/Q5_K carry d,dmin at offset 0; Q6_K carries d at the END of its 210-byte block.
+    """
+    blk = _GGUF_K_BLOCK_BYTES[ggml_type]
+    one = torch.tensor([0x00, 0x3C], dtype=torch.uint8)  # fp16 1.0, little endian
+    v = bank.view(bank.shape[0], rows, row_bytes)
+    for b0 in range(0, row_bytes, blk):
+        if ggml_type == 14:  # Q6_K: ggml_half d is the last field
+            v[:, :, b0 + blk - 2: b0 + blk] = one
+        else:  # Q4_K / Q5_K: d then dmin
+            v[:, :, b0: b0 + 2] = one
+            v[:, :, b0 + 2: b0 + 4] = one
 
 
 def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
@@ -340,6 +396,19 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         b["gate_up_global"].fill_(1.0)
         b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
         return b
+    if fmt == "gguf_k":  # FT-CPU-KQUANT-CPUBANKS
+        # Flat per-expert regions of ggml block bytes, exactly as the GGUF loader
+        # builds them. Random bytes are fine: every K-quant code is finite, and the
+        # fp16 super-block scales are the only field that could denormal -- clamp
+        # those to a unit-ish exponent so the timing is not skewed.
+        gu_t, dn_t = _GGUF_K_BENCH_TYPES
+        gu = pin(E, 2 * I * _gguf_k_row_bytes(H, gu_t), 1, dtype=torch.uint8)
+        dn = pin(E, H * _gguf_k_row_bytes(I, dn_t), 1, dtype=torch.uint8)
+        gu.random_(0, 256)
+        dn.random_(0, 256)
+        _gguf_k_fix_scales(gu, 2 * I, _gguf_k_row_bytes(H, gu_t), gu_t)
+        _gguf_k_fix_scales(dn, H, _gguf_k_row_bytes(I, dn_t), dn_t)
+        return {"gate_up": gu, "down": dn}
     if fmt == "mxfp4_triton":  # transposed split-K layout
         b = {
             "gate_up_blocks": pin(E, H // 2, 2 * I, dtype=torch.uint8),
@@ -443,6 +512,14 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
         bank_sources={name: [t] for name, t in banks.items()},
         num_layers=1, num_experts=E,
         decode_target="cpu", cpu_executor=None,
+        # FT-CPU-KQUANT-BENCHMETA: gguf_k's flat banks carry no geometry (see
+        # cpu_executor._resolve_gguf_k_banks); the engine attaches this from the
+        # model config, the bench from the synthetic workload.
+        gguf_k_meta={
+            "hidden": wl.hidden, "inter": wl.inter,
+            "gate_up_types": (_GGUF_K_BENCH_TYPES[0],),
+            "down_types": (_GGUF_K_BENCH_TYPES[1],),
+        },
     )
     return CpuMoeExecutor(
         cache, top_k=wl.top_k, activation=wl.activation,

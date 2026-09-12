@@ -568,6 +568,17 @@ class Engine:
             )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if banks.quant_format == "gguf_k":  # FT-CPU-KQUANT-META
+                # The CPU expert kernels need the geometry the flat K-quant banks do
+                # not carry: hidden/inter sizes and the per-layer ggml types (this
+                # checkpoint is Q5_K `down` on 37 layers and Q6_K on 3).
+                mc = config.model_config
+                cache.gguf_k_meta = {
+                    "hidden": int(mc.hidden_size),
+                    "inter": int(mc.moe_intermediate_size),
+                    "gate_up_types": tuple(mc.moe_gguf_gate_up_types),
+                    "down_types": tuple(mc.moe_gguf_down_types),
+                }
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target

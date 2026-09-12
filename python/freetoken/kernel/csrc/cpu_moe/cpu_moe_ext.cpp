@@ -1212,7 +1212,521 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+
+// ---------------------- GGUF K-quants: Q4_K / Q5_K / Q6_K (W*A8) ----------------------
+// FT-CPU-KQUANT. PORTED from llama.cpp / ggml (MIT) -- with thanks to the ggml authors:
+//
+//   * the AVX2 branches of ggml_vec_dot_q4_K_q8_K / _q5_K_ / _q6_K_
+//     (ggml/src/ggml-cpu/arch/x86/quants.c:1900 / :2078 / :2288),
+//   * their scalar twins ggml_vec_dot_*_generic (ggml/src/ggml-cpu/quants.c:645 / :720 / :800),
+//   * quantize_row_q8_K_ref (ggml/src/ggml-quants.c:2692),
+//   * the get_scale_shuffle_k4 / get_scale_shuffle byte tables (arch/x86/quants.c:527 / :540).
+//
+// Only the plumbing is ours: ggml's `(n, s, bs, vx, bx, vy, by, nrc)` entry points become
+// `float (const void* w, const block_q8_K* a, int K)`, matching the GEMV call sites here.
+//
+// Why this format does not reuse the Q4_0 W4A8 path next door: a K-quant super-block
+// covers QK_K = 256 elements, not 32, and Q4_K/Q5_K are AFFINE -- w = d*sc*q - dmin*m --
+// so the `dmin*m` term needs the SUM of the activation ints over each group of 16, which
+// ggml precomputes into block_q8_K::bsums. Q6_K is symmetric (w = d*sc*(q-32)) and folds
+// its -32 through the same bsums. Hence a block_q8_K activation (fp32 d + 256 int8 + 16
+// int16 group sums) instead of Q8_0's int8 + one scale per 32.
+//
+// The weights are read in place: the host expert banks hold the GGUF tensor's own ggml
+// block bytes (see qwen3_5_moe.gguf.load_gguf_k_expert_sources), which is exactly the
+// layout these dots expect, so the CPU path costs no repack and no extra host memory.
+
+constexpr int FT_QK_K = 256;
+
+// ggml type ids (ggml.h; mirrored by freetoken.models.gguf.dequant).
+enum { FT_GGML_Q4_K = 12, FT_GGML_Q5_K = 13, FT_GGML_Q6_K = 14 };
+
+#pragma pack(push, 1)
+struct ft_block_q4_K {  // 144 B per 256 weights
+  uint16_t d;           // fp16 super-block scale for the 6-bit scales
+  uint16_t dmin;        // fp16 super-block scale for the 6-bit mins
+  uint8_t scales[12];   // 8 x (6-bit scale, 6-bit min)
+  uint8_t qs[128];      // 4-bit quants
+};
+struct ft_block_q5_K {  // 176 B per 256 weights
+  uint16_t d, dmin;
+  uint8_t scales[12];
+  uint8_t qh[32];       // 5th bit
+  uint8_t qs[128];      // low 4 bits
+};
+struct ft_block_q6_K {  // 210 B per 256 weights
+  uint8_t ql[128];      // low 4 bits
+  uint8_t qh[64];       // high 2 bits
+  int8_t scales[16];    // one int8 scale per 16 weights
+  uint16_t d;           // fp16 super-block scale
+};
+struct ft_block_q8_K {  // 292 B per 256 activations
+  float d;
+  int8_t qs[FT_QK_K];
+  int16_t bsums[FT_QK_K / 16];
+};
+#pragma pack(pop)
+static_assert(sizeof(ft_block_q4_K) == 144, "q4_K block size");
+static_assert(sizeof(ft_block_q5_K) == 176, "q5_K block size");
+static_assert(sizeof(ft_block_q6_K) == 210, "q6_K block size");
+static_assert(sizeof(ft_block_q8_K) == 292, "q8_K block size");
+
+// Packed byte length of one K-element row in ``ggml_type`` (mirrors dequant.row_bytes).
+inline int ft_k_row_bytes(int K, int ggml_type) {
+  int ts;
+  switch (ggml_type) {
+    case FT_GGML_Q4_K: ts = (int)sizeof(ft_block_q4_K); break;
+    case FT_GGML_Q5_K: ts = (int)sizeof(ft_block_q5_K); break;
+    case FT_GGML_Q6_K: ts = (int)sizeof(ft_block_q6_K); break;
+    default:
+      throw std::runtime_error("gguf_k CPU MoE: unsupported ggml type " +
+                               std::to_string(ggml_type) +
+                               " (only Q4_K=12, Q5_K=13, Q6_K=14 are implemented)");
+  }
+  if (K <= 0 || K % FT_QK_K != 0)
+    throw std::runtime_error("gguf_k CPU MoE: K must be a positive multiple of 256, got " +
+                             std::to_string(K));
+  return (K / FT_QK_K) * ts;
+}
+
+// Q4_K/Q5_K pack 8 six-bit scales and 8 six-bit mins into 12 bytes; ggml's unpack, after
+// which ``(const uint8_t*)&utmp[0]`` is scales[0..7] and ``&utmp[2]`` is mins[0..7].
+inline void ft_k_unpack_sc_min(const uint8_t* src12, uint32_t utmp[4]) {
+  constexpr uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+  std::memcpy(utmp, src12, 12);
+  utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+  const uint32_t uaux = utmp[1] & kmask1;
+  utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+  utmp[2] = uaux;
+  utmp[0] &= kmask1;
+}
+
+// One packed weight row (K elements of some K-quant) x one block_q8_K activation row.
+using kdot_fn = float (*)(const void*, const ft_block_q8_K*, int);
+
+// ggml's nearest_int (ggml/src/ggml-quants.c): round-half-to-EVEN via the 2^23 magic
+// addend. Not interchangeable with std::lround (half away from zero) -- keeping ggml's
+// makes the activation quantization bit-identical to llama.cpp's, so the reference check
+// in verify/kquant_check.py can use numpy's np.rint and expect an exact match.
+inline int ft_nearest_int(float fval) {
+  float val = fval + 12582912.0f;
+  int32_t i;
+  std::memcpy(&i, &val, sizeof(i));
+  return (i & 0x007fffff) - 0x00400000;
+}
+
+// Quantize a bf16 activation row to block_q8_K (ggml quantize_row_q8_K_ref, bf16 input).
+// Done once per (token, route) and amortized over every output row the GEMV reads.
+inline void ft_quant_q8_K(const bf16_t* x, int K, ft_block_q8_K* y) {
+  const int nb = K / FT_QK_K;
+  for (int i = 0; i < nb; ++i) {
+    const bf16_t* xb = x + (size_t)i * FT_QK_K;
+    float xf[FT_QK_K];
+    float amax = 0.0f, vmax = 0.0f;
+    for (int j = 0; j < FT_QK_K; ++j) {
+      xf[j] = bf16_to_f32(xb[j]);
+      const float ax = std::fabs(xf[j]);
+      if (ax > amax) { amax = ax; vmax = xf[j]; }
+    }
+    if (amax == 0.0f) {
+      y[i].d = 0.0f;
+      std::memset(y[i].qs, 0, sizeof(y[i].qs));
+      std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+      continue;
+    }
+    // ggml uses -127/max (not -128/max): it keeps the AVX2 IQ paths simple and costs
+    // nothing here. d comes back negative when max > 0; d*q reconstructs x either way.
+    const float iscale = -127.0f / vmax;
+    for (int j = 0; j < FT_QK_K; ++j) {
+      const int v = ft_nearest_int(iscale * xf[j]);
+      y[i].qs[j] = (int8_t)std::min(127, v);
+    }
+    for (int j = 0; j < FT_QK_K / 16; ++j) {
+      int sum = 0;
+      for (int l = 0; l < 16; ++l) sum += y[i].qs[j * 16 + l];
+      y[i].bsums[j] = (int16_t)sum;
+    }
+    y[i].d = 1.0f / iscale;
+  }
+}
+
+// ------------------------------- scalar tier (ggml *_generic) -------------------------
+float k_dot_q4_K_scalar(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q4_K* x = reinterpret_cast<const ft_block_q4_K*>(vx);
+  const int nb = K / FT_QK_K;
+  uint32_t utmp[4];
+  const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+  const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+  int8_t aux8[FT_QK_K];
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* q4 = x[i].qs;
+    const int8_t* q8 = y[i].qs;
+    int8_t* a = aux8;
+    for (int j = 0; j < FT_QK_K / 64; ++j) {
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] & 0xF);
+      a += 32;
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] >> 4);
+      a += 32;
+      q4 += 32;
+    }
+    ft_k_unpack_sc_min(x[i].scales, utmp);
+    int sumi = 0;
+    for (int j = 0; j < FT_QK_K / 16; ++j) sumi += y[i].bsums[j] * mins[j / 2];
+    a = aux8;
+    int64_t acc = 0;
+    for (int j = 0; j < FT_QK_K / 32; ++j) {
+      const int32_t scale = scales[j];
+      int32_t s32 = 0;
+      for (int l = 0; l < 32; ++l) s32 += (int32_t)q8[l] * (int32_t)a[l];
+      acc += (int64_t)scale * s32;
+      q8 += 32;
+      a += 32;
+    }
+    sumf += fp16_to_f32(x[i].d) * y[i].d * (float)acc;
+    sumf -= fp16_to_f32(x[i].dmin) * y[i].d * (float)sumi;
+  }
+  return sumf;
+}
+
+float k_dot_q5_K_scalar(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q5_K* x = reinterpret_cast<const ft_block_q5_K*>(vx);
+  const int nb = K / FT_QK_K;
+  uint32_t utmp[4];
+  const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
+  const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
+  int8_t aux8[FT_QK_K];
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* q4 = x[i].qs;
+    const uint8_t* hm = x[i].qh;
+    const int8_t* q8 = y[i].qs;
+    int8_t* a = aux8;
+    uint8_t m = 1;
+    for (int j = 0; j < FT_QK_K / 64; ++j) {
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] & 0xF);
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(a[l] + ((hm[l] & m) ? 16 : 0));
+      a += 32;
+      m <<= 1;
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] >> 4);
+      for (int l = 0; l < 32; ++l) a[l] = (int8_t)(a[l] + ((hm[l] & m) ? 16 : 0));
+      a += 32;
+      m <<= 1;
+      q4 += 32;
+    }
+    ft_k_unpack_sc_min(x[i].scales, utmp);
+    int sumi = 0;
+    for (int j = 0; j < FT_QK_K / 16; ++j) sumi += y[i].bsums[j] * mins[j / 2];
+    a = aux8;
+    int64_t acc = 0;
+    for (int j = 0; j < FT_QK_K / 32; ++j) {
+      const int32_t scale = scales[j];
+      int32_t s32 = 0;
+      for (int l = 0; l < 32; ++l) s32 += (int32_t)q8[l] * (int32_t)a[l];
+      acc += (int64_t)scale * s32;
+      q8 += 32;
+      a += 32;
+    }
+    sumf += fp16_to_f32(x[i].d) * y[i].d * (float)acc;
+    sumf -= fp16_to_f32(x[i].dmin) * y[i].d * (float)sumi;
+  }
+  return sumf;
+}
+
+float k_dot_q6_K_scalar(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q6_K* x = reinterpret_cast<const ft_block_q6_K*>(vx);
+  const int nb = K / FT_QK_K;
+  int8_t aux8[FT_QK_K];
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* q4 = x[i].ql;
+    const uint8_t* qh = x[i].qh;
+    const int8_t* q8 = y[i].qs;
+    int8_t* a = aux8;
+    for (int j = 0; j < FT_QK_K; j += 128) {
+      for (int l = 0; l < 32; ++l) {
+        a[l + 0] = (int8_t)((q4[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        a[l + 32] = (int8_t)((q4[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        a[l + 64] = (int8_t)((q4[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        a[l + 96] = (int8_t)((q4[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+      }
+      a += 128;
+      q4 += 64;
+      qh += 32;
+    }
+    a = aux8;
+    int64_t acc = 0;
+    for (int j = 0; j < FT_QK_K / 16; ++j) {
+      const int32_t scale = x[i].scales[j];
+      int32_t s32 = 0;
+      for (int l = 0; l < 16; ++l) s32 += (int32_t)q8[l] * (int32_t)a[l];
+      acc += (int64_t)scale * s32;
+      q8 += 16;
+      a += 16;
+    }
+    sumf += fp16_to_f32(x[i].d) * y[i].d * (float)acc;
+  }
+  return sumf;
+}
+
+#if CPU_MOE_X86
+#define FT_MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+
+// ggml's scale-broadcast byte tables (arch/x86/quants.c). k4: 16-bit scale i broadcast
+// over a 256-bit lane pair; the 8-bit one: scale i broadcast over 8 bytes twice.
+__attribute__((target("avx2")))
+static inline __m256i ft_scale_shuffle_k4(int i) {
+  static const uint8_t k_shuffle[256] = {
+      0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+      2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+      4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,
+      6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+      8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,
+      10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+      10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11,
+      12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+      12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13,
+      14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+      14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15};
+  return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k_shuffle) + i);
+}
+
+__attribute__((target("avx2")))
+static inline __m128i ft_scale_shuffle(int i) {
+  static const uint8_t k_shuffle[128] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+      2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+      4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
+      6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+      8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+      10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+      12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+      14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15};
+  return _mm_loadu_si128(reinterpret_cast<const __m128i*>(k_shuffle) + i);
+}
+
+// ggml_vec_dot_q4_K_q8_K, AVX2 branch (arch/x86/quants.c:1919-1982).
+__attribute__((target("avx2,fma")))
+float k_dot_q4_K_avx2(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q4_K* x = reinterpret_cast<const ft_block_q4_K*>(vx);
+  const int nb = K / FT_QK_K;
+  const __m256i m4 = _mm256_set1_epi8(0xF);
+  __m256 acc = _mm256_setzero_ps();
+  __m128 acc_m = _mm_setzero_ps();
+  uint32_t utmp[4];
+  for (int i = 0; i < nb; ++i) {
+    _mm_prefetch(reinterpret_cast<const char*>(x + i) + 512, _MM_HINT_T0);
+    const float d = y[i].d * fp16_to_f32(x[i].d);
+    const float dmin = -y[i].d * fp16_to_f32(x[i].dmin);
+    ft_k_unpack_sc_min(x[i].scales, utmp);
+    const uint8_t* q4 = x[i].qs;
+    const int8_t* q8 = y[i].qs;
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+        _mm_set_epi32((int)utmp[3], (int)utmp[2], (int)utmp[1], (int)utmp[0]));
+    const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].bsums));
+    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                       _mm256_extracti128_si256(q8sums, 1));
+    const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+    acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+    const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+    const __m256i scales = FT_MM256_SET_M128I(sc128, sc128);
+    __m256i sumi = _mm256_setzero_si256();
+    for (int j = 0; j < FT_QK_K / 64; ++j) {
+      const __m256i scale_l = _mm256_shuffle_epi8(scales, ft_scale_shuffle_k4(2 * j + 0));
+      const __m256i scale_h = _mm256_shuffle_epi8(scales, ft_scale_shuffle_k4(2 * j + 1));
+      const __m256i q4bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4));
+      q4 += 32;
+      const __m256i q4l = _mm256_and_si256(q4bits, m4);
+      const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+      const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+      q8 += 32;
+      const __m256i p16l = _mm256_madd_epi16(scale_l, _mm256_maddubs_epi16(q4l, q8l));
+      const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+      q8 += 32;
+      const __m256i p16h = _mm256_madd_epi16(scale_h, _mm256_maddubs_epi16(q4h, q8h));
+      sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+    }
+    acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+  }
+  acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+  acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+  return hsum256(acc) + _mm_cvtss_f32(acc_m);
+}
+
+// ggml_vec_dot_q5_K_q8_K, AVX2 branch (arch/x86/quants.c:2097-2174).
+__attribute__((target("avx2,fma")))
+float k_dot_q5_K_avx2(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q5_K* x = reinterpret_cast<const ft_block_q5_K*>(vx);
+  const int nb = K / FT_QK_K;
+  const __m256i m4 = _mm256_set1_epi8(0xF);
+  const __m128i mzero = _mm_setzero_si128();
+  const __m256i mone = _mm256_set1_epi8(1);
+  __m256 acc = _mm256_setzero_ps();
+  float summs = 0.0f;
+  uint32_t utmp[4];
+  for (int i = 0; i < nb; ++i) {
+    _mm_prefetch(reinterpret_cast<const char*>(x + i) + 512, _MM_HINT_T0);
+    const uint8_t* q5 = x[i].qs;
+    const int8_t* q8 = y[i].qs;
+    const float d = y[i].d * fp16_to_f32(x[i].d);
+    const float dmin = -y[i].d * fp16_to_f32(x[i].dmin);
+    ft_k_unpack_sc_min(x[i].scales, utmp);
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+        _mm_set_epi32((int)utmp[3], (int)utmp[2], (int)utmp[1], (int)utmp[0]));
+    const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].bsums));
+    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                       _mm256_extracti128_si256(q8sums, 1));
+    const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+    const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+    summs += dmin * (float)_mm_extract_epi32(hsum, 0);
+    const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+    const __m256i scales = FT_MM256_SET_M128I(sc128, sc128);
+    const __m256i hbits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[i].qh));
+    __m256i hmask = mone;
+    __m256i sumi = _mm256_setzero_si256();
+    int bit = 0;
+    for (int j = 0; j < FT_QK_K / 64; ++j) {
+      const __m256i scale_0 = _mm256_shuffle_epi8(scales, ft_scale_shuffle_k4(2 * j + 0));
+      const __m256i scale_1 = _mm256_shuffle_epi8(scales, ft_scale_shuffle_k4(2 * j + 1));
+      const __m256i q5bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q5));
+      q5 += 32;
+      const __m256i q5l_0 = _mm256_and_si256(q5bits, m4);
+      const __m256i q5h_0 =
+          _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+      const __m256i q5_0 = _mm256_add_epi8(q5l_0, q5h_0);
+      hmask = _mm256_slli_epi16(hmask, 1);
+      const __m256i q5l_1 = _mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4);
+      const __m256i q5h_1 =
+          _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+      const __m256i q5_1 = _mm256_add_epi8(q5l_1, q5h_1);
+      hmask = _mm256_slli_epi16(hmask, 1);
+      const __m256i q8_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+      q8 += 32;
+      const __m256i q8_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+      q8 += 32;
+      const __m256i p16_0 = _mm256_madd_epi16(scale_0, _mm256_maddubs_epi16(q5_0, q8_0));
+      const __m256i p16_1 = _mm256_madd_epi16(scale_1, _mm256_maddubs_epi16(q5_1, q8_1));
+      sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+    }
+    acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+  }
+  return hsum256(acc) + summs;
+}
+
+// ggml_vec_dot_q6_K_q8_K, AVX2 branch (arch/x86/quants.c:2301-2370). Q6_K is symmetric:
+// the -32 offset is applied once per group through bsums (q8sclsub) instead of per weight.
+__attribute__((target("avx2,fma")))
+float k_dot_q6_K_avx2(const void* vx, const ft_block_q8_K* y, int K) {
+  const ft_block_q6_K* x = reinterpret_cast<const ft_block_q6_K*>(vx);
+  const int nb = K / FT_QK_K;
+  const __m256i m3 = _mm256_set1_epi8(3);
+  const __m256i m15 = _mm256_set1_epi8(15);
+  __m256 acc = _mm256_setzero_ps();
+  for (int i = 0; i < nb; ++i) {
+    _mm_prefetch(reinterpret_cast<const char*>(x + i) + 512, _MM_HINT_T0);
+    const float d = y[i].d * fp16_to_f32(x[i].d);
+    const uint8_t* q4 = x[i].ql;
+    const uint8_t* qh = x[i].qh;
+    const int8_t* q8 = y[i].qs;
+    const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].bsums));
+    const __m128i scales = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].scales));
+    const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
+    const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
+    __m256i sumi = _mm256_setzero_si256();
+    int is = 0;
+    for (int j = 0; j < FT_QK_K / 128; ++j) {
+      const __m256i q4bits1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4));
+      q4 += 32;
+      const __m256i q4bits2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4));
+      q4 += 32;
+      const __m256i q4bitsH = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+      qh += 32;
+      const __m256i q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, m3), 4);
+      const __m256i q4h_1 =
+          _mm256_slli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8(12)), 2);
+      const __m256i q4h_2 = _mm256_and_si256(q4bitsH, _mm256_set1_epi8(48));
+      const __m256i q4h_3 =
+          _mm256_srli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8((char)-64)), 2);
+      const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m15), q4h_0);
+      const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m15), q4h_1);
+      const __m256i q4_2 =
+          _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m15), q4h_2);
+      const __m256i q4_3 =
+          _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m15), q4h_3);
+      const __m256i q8_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8)); q8 += 32;
+      const __m256i q8_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8)); q8 += 32;
+      const __m256i q8_2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8)); q8 += 32;
+      const __m256i q8_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8)); q8 += 32;
+      __m256i p16_0 = _mm256_maddubs_epi16(q4_0, q8_0);
+      __m256i p16_1 = _mm256_maddubs_epi16(q4_1, q8_1);
+      __m256i p16_2 = _mm256_maddubs_epi16(q4_2, q8_2);
+      __m256i p16_3 = _mm256_maddubs_epi16(q4_3, q8_3);
+      const __m128i scale_0 = _mm_shuffle_epi8(scales, ft_scale_shuffle(is + 0));
+      const __m128i scale_1 = _mm_shuffle_epi8(scales, ft_scale_shuffle(is + 1));
+      const __m128i scale_2 = _mm_shuffle_epi8(scales, ft_scale_shuffle(is + 2));
+      const __m128i scale_3 = _mm_shuffle_epi8(scales, ft_scale_shuffle(is + 3));
+      is += 4;
+      p16_0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_0), p16_0);
+      p16_1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_1), p16_1);
+      p16_2 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_2), p16_2);
+      p16_3 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale_3), p16_3);
+      sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+      sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_2, p16_3));
+    }
+    sumi = _mm256_sub_epi32(sumi, q8sclsub);
+    acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+  }
+  return hsum256(acc);
+}
+#endif  // CPU_MOE_X86
+
+kdot_fn select_kdot_scalar(int ggml_type) {
+  switch (ggml_type) {
+    case FT_GGML_Q4_K: return k_dot_q4_K_scalar;
+    case FT_GGML_Q5_K: return k_dot_q5_K_scalar;
+    case FT_GGML_Q6_K: return k_dot_q6_K_scalar;
+    default:
+      throw std::runtime_error("gguf_k CPU MoE: unsupported ggml type " +
+                               std::to_string(ggml_type));
+  }
+}
+
+// Dot for one ggml type at the best tier this CPU+build supports. The scalar tier is the
+// correctness reference; FREETOKEN_CPU_MOE_ISA=scalar (or FREETOKEN_CPU_MOE_SCALAR=1)
+// forces it, which is how the ported AVX2 kernels are A/B'd against it in place.
+kdot_fn select_kdot(int ggml_type) {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (t >= ISA_AVX2) {
+    switch (ggml_type) {
+      case FT_GGML_Q4_K: return k_dot_q4_K_avx2;
+      case FT_GGML_Q5_K: return k_dot_q5_K_avx2;
+      case FT_GGML_Q6_K: return k_dot_q6_K_avx2;
+      default: break;
+    }
+  }
+#endif
+  (void)t;
+  return select_kdot_scalar(ggml_type);
+}
+
+// FT-CPU-KQUANT-PROBE. One packed K-quant weight row x one bf16 activation row, through
+// the same quantizer and the same dot the GEMV uses. Exported so the ported kernels can
+// be checked in isolation against a float64 dequant reference (verify/kquant_check.py)
+// -- an end-to-end MoE comparison hides a wrong dot behind the router and the epilogue.
+float kdot_probe(int ggml_type, uintptr_t w_ptr, uintptr_t x_ptr, int K, bool scalar) {
+  if (K <= 0 || K % FT_QK_K != 0)
+    throw std::runtime_error("kdot_probe: K must be a positive multiple of 256");
+  const kdot_fn f = scalar ? select_kdot_scalar(ggml_type) : select_kdot(ggml_type);
+  std::vector<ft_block_q8_K> a(K / FT_QK_K);
+  ft_quant_q8_K(reinterpret_cast<const bf16_t*>(x_ptr), K, a.data());
+  return f(reinterpret_cast<const void*>(w_ptr), a.data(), K);
+}
+
+enum WFmt {
+  WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4,
+  WF_GGUF_K = 5,  // native GGUF K-quant blocks, ggml type PER LAYER (see FT-CPU-KQUANT)
+};
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1261,6 +1775,17 @@ struct CpuMoeExecutor {
   bool input_prequant = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
+  // FT-CPU-KQUANT-FIELDS. gguf_k: one ggml type PER LAYER, so the packed row width and
+  // the dot are per-layer tables, not one weight_format for the model. The per-expert
+  // stride is the bank's own (rows are padded to the widest type over layers, see
+  // qwen3_5_moe.gguf._bank_geometry), so it cannot be derived from rows * row_bytes.
+  bool use_q8k = false;         // gguf_k: activations quantized to block_q8_K
+  bool gk_ready = false;        // set_gguf_k_layout has run
+  std::vector<int> gk_gu_row_bytes, gk_dn_row_bytes;  // [num_layers]
+  std::vector<kdot_fn> gk_gu_dot, gk_dn_dot;          // [num_layers]
+  int64_t gk_gu_expert_bytes = 0, gk_dn_expert_bytes = 0;
+  std::vector<ft_block_q8_K> xq8k_scratch;  // [max_tokens * H/256]
+  std::vector<ft_block_q8_K> gq8k_scratch;  // [max_tokens * top_k * I/256]
   float e2m1_lut[16];
   float e4m3_lut[256];
   float e8m0_lut[256];         // mxfp4 block scale: 2^(s-127), s clamped to [0,254]
@@ -1381,6 +1906,12 @@ struct CpuMoeExecutor {
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
       q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
     }
+    // FT-CPU-KQUANT-CTOR: the per-layer ggml types arrive after construction (the ctor
+    // signature is shared with every other format); only the QK_K divisibility that
+    // fixes the scratch shape is checked here.
+    if (weight_format == WF_GGUF_K && (H % FT_QK_K != 0 || I % FT_QK_K != 0))
+      throw std::runtime_error(
+          "gguf_k CPU MoE requires H and I to be multiples of 256 (QK_K)");
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
@@ -1388,10 +1919,12 @@ struct CpuMoeExecutor {
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
+    use_q8k = (weight_format == WF_GGUF_K);  // FT-CPU-KQUANT-ISA
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
-    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag +
+              (use_q8k ? "+gguf_k-w8a8" : "");  // FT-CPU-KQUANT-TAG
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
@@ -1419,6 +1952,13 @@ struct CpuMoeExecutor {
       xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 32), 0);
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
+    }
+    // FT-CPU-KQUANT-SCRATCH. gguf_k: per-256 block_q8_K activations (fp32 d + 256 int8
+    // + 16 int16 group sums) for the input and the intermediate.
+    if (use_q8k) {
+      xq8k_scratch.assign(static_cast<size_t>(max_tokens) * (H / FT_QK_K), {});
+      gq8k_scratch.assign(
+          static_cast<size_t>(max_tokens) * top_k * (I / FT_QK_K), {});
     }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
@@ -1468,6 +2008,37 @@ struct CpuMoeExecutor {
     }
   }
 
+  // FT-CPU-KQUANT-LAYOUT. Register the per-layer ggml types (and the bank's per-expert
+  // byte stride, which the padded bank shape fixes -- see _bank_geometry). Must run
+  // before the first task; cpu_executor.py calls it straight after construction.
+  void set_gguf_k_layout(std::vector<int> gu_types, std::vector<int> dn_types,
+                         int64_t gu_expert_bytes, int64_t dn_expert_bytes) {
+    if (fmt != WF_GGUF_K)
+      throw std::runtime_error("set_gguf_k_layout on a non-gguf_k CPU MoE executor");
+    if (static_cast<int>(gu_types.size()) != num_layers ||
+        static_cast<int>(dn_types.size()) != num_layers)
+      throw std::runtime_error("gguf_k CPU MoE: one ggml type per layer is required");
+    gk_gu_row_bytes.assign(num_layers, 0);
+    gk_dn_row_bytes.assign(num_layers, 0);
+    gk_gu_dot.assign(num_layers, nullptr);
+    gk_dn_dot.assign(num_layers, nullptr);
+    for (int l = 0; l < num_layers; ++l) {
+      gk_gu_row_bytes[l] = ft_k_row_bytes(H, gu_types[l]);
+      gk_dn_row_bytes[l] = ft_k_row_bytes(I, dn_types[l]);
+      gk_gu_dot[l] = select_kdot(gu_types[l]);
+      gk_dn_dot[l] = select_kdot(dn_types[l]);
+      // A layer's rows must fit inside the per-expert region the bank was sized for.
+      if ((int64_t)gk_gu_row_bytes[l] * (2 * I) > gu_expert_bytes ||
+          (int64_t)gk_dn_row_bytes[l] * H > dn_expert_bytes)
+        throw std::runtime_error(
+            "gguf_k CPU MoE: layer " + std::to_string(l) +
+            " rows overflow the expert bank region");
+    }
+    gk_gu_expert_bytes = gu_expert_bytes;
+    gk_dn_expert_bytes = dn_expert_bytes;
+    gk_ready = true;
+  }
+
   // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H. ``e`` is
   // the layer-local expert row (0..num_experts); the layer bases (already resolved
   // once per task/pass by the caller via tbl_at) pick the layer's own tensors.
@@ -1476,7 +2047,7 @@ struct CpuMoeExecutor {
   inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
-                         const float* xas) {
+                         const float* xas, int layer = 0) {  // FT-CPU-KQUANT-SIG1
     if (fmt == WF_BF16) {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
@@ -1485,6 +2056,14 @@ struct CpuMoeExecutor {
       const uint8_t* w =
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
       return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
+    }
+    if (fmt == WF_GGUF_K) {  // FT-CPU-KQUANT-GEMM1
+      // Per-expert stride is the bank's padded region; rows sit at this LAYER's own
+      // width from its start (gate rows then up rows). ``xi8`` carries the token's
+      // block_q8_K row (the executor's int8 activation slot, reinterpreted).
+      const uint8_t* w = gu_packed_l + (size_t)e * (size_t)gk_gu_expert_bytes +
+                         (size_t)row * (size_t)gk_gu_row_bytes[layer];
+      return gk_gu_dot[layer](w, reinterpret_cast<const ft_block_q8_K*>(xi8), H);
     }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
@@ -1499,7 +2078,7 @@ struct CpuMoeExecutor {
   inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
                          const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
-                         const float* gas) {
+                         const float* gas, int layer = 0) {  // FT-CPU-KQUANT-SIG2
     if (fmt == WF_BF16) {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
@@ -1507,6 +2086,11 @@ struct CpuMoeExecutor {
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
       return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_GGUF_K) {  // FT-CPU-KQUANT-GEMM2
+      const uint8_t* w = dn_packed_l + (size_t)e * (size_t)gk_dn_expert_bytes +
+                         (size_t)row * (size_t)gk_dn_row_bytes[layer];
+      return gk_dn_dot[layer](w, reinterpret_cast<const ft_block_q8_K*>(gi8), I);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -1596,8 +2180,13 @@ struct CpuMoeExecutor {
     const bf16_t* x_row = t->x + (size_t)tok * H;
     const float* xe = needs_di ? xe_scratch.data() + (size_t)tok * (H / 2) : nullptr;
     const float* xo = needs_di ? xo_scratch.data() + (size_t)tok * (H / 2) : nullptr;
+    // FT-CPU-KQUANT-PASS1: gguf_k rides the int8 activation slot with its block_q8_K
+    // row (fp32 d + 256 int8 + 16 int16 bsums per 256 K); gemm1_dot casts it back.
     const int8_t* xi8 =
-        (use_vnni || use_q4a8) ? xi8_scratch.data() + (size_t)tok * H : nullptr;
+        (use_vnni || use_q4a8) ? xi8_scratch.data() + (size_t)tok * H
+        : use_q8k ? reinterpret_cast<const int8_t*>(
+                        xq8k_scratch.data() + (size_t)tok * (H / FT_QK_K))
+                  : nullptr;
     const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
                      : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
@@ -1608,10 +2197,11 @@ struct CpuMoeExecutor {
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
-      float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
+      float gate =  // FT-CPU-KQUANT-CALL1
+          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8,
+                    xas, t->layer_id) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
+                           xe, xo, xi8, xas, t->layer_id) * w_in;
       if (swigluoai) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
         // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
@@ -1656,12 +2246,16 @@ struct CpuMoeExecutor {
         const bf16_t* g_row = g_scratch.data() + gr * I;
         const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
         const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
-        const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
+        // FT-CPU-KQUANT-PASS2: see FT-CPU-KQUANT-PASS1 for the block_q8_K aliasing.
+        const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I
+                          : use_q8k ? reinterpret_cast<const int8_t*>(
+                                          gq8k_scratch.data() + gr * (I / FT_QK_K))
+                                    : nullptr;
         const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
                          : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
         acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas) * w_out;
+                         gas, t->layer_id) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
     }
@@ -1793,6 +2387,10 @@ struct CpuMoeExecutor {
                  gas_scratch.data() + (size_t)r * (I / 32));
       return;
     }
+    if (use_q8k) {  // FT-CPU-KQUANT-PREPG: block_q8_K for the K-quant down GEMV
+      ft_quant_q8_K(g, I, gq8k_scratch.data() + (size_t)r * (I / FT_QK_K));
+      return;
+    }
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
     float* ge = ge_scratch.data() + (size_t)r * (I / 2);
     float* go = go_scratch.data() + (size_t)r * (I / 2);
@@ -1841,7 +2439,7 @@ struct CpuMoeExecutor {
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    if (needs_di || use_q4a8 || use_q8k) {  // FT-CPU-KQUANT-BODY
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
@@ -1889,7 +2487,9 @@ struct CpuMoeExecutor {
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
-    prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    prt_total = (needs_di || use_q4a8 || use_q8k)  // FT-CPU-KQUANT-PRT
+                    ? static_cast<int64_t>(t->num_tokens) * top_k
+                    : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -1941,6 +2541,22 @@ struct CpuMoeExecutor {
       for (int tok = 0; tok < t->num_tokens; ++tok)
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
+    }
+    // FT-CPU-KQUANT-SUBMIT. gguf_k: block_q8_K-quantize the per-token input once
+    // (single-threaded, tiny for decode), same shape as the q4_0 Q8_0 pass above.
+    if (use_q8k) {
+      if (!gk_ready)
+        throw std::runtime_error(
+            "gguf_k CPU MoE: set_gguf_k_layout() was never called");
+      const size_t xn = static_cast<size_t>(t->num_tokens) * (H / FT_QK_K);
+      if (xn > xq8k_scratch.size()) {
+        xq8k_scratch.resize(xn);
+        gq8k_scratch.resize(
+            static_cast<size_t>(t->num_tokens) * top_k * (I / FT_QK_K));
+      }
+      for (int tok = 0; tok < t->num_tokens; ++tok)
+        ft_quant_q8_K(t->x + (size_t)tok * H, H,
+                      xq8k_scratch.data() + (size_t)tok * (H / FT_QK_K));
     }
     {
       std::lock_guard<std::mutex> lk(task_mtx);
@@ -2131,10 +2747,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
+      .def("set_gguf_k_layout", &CpuMoeExecutor::set_gguf_k_layout,  // FT-CPU-KQUANT-PYBIND
+           py::arg("gate_up_types"), py::arg("down_types"),
+           py::arg("gate_up_expert_bytes"), py::arg("down_expert_bytes"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name);
+  // FT-CPU-KQUANT-PROBEDEF: isolated K-quant dot, for the correctness harness.
+  m.def("kdot_probe", &kdot_probe, py::arg("ggml_type"), py::arg("w_ptr"),
+        py::arg("x_ptr"), py::arg("k"), py::arg("scalar") = false);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));
