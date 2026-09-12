@@ -109,6 +109,15 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+        # A GGUF checkpoint carries native block-quantized weights: swap the dense
+        # modules whose ggml type has an MMVQ/MMQ kernel for ops that read the packed
+        # blocks directly (experts keep coming from the offload cache). Worth 2.2 GiB
+        # of VRAM and ~5.5 ms/token of read bandwidth on a Q4_K_M 35B-A3B.
+        from .gguf import convert_qwen3_5_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen3_5_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)

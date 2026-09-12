@@ -285,6 +285,11 @@ class ModelConfig:
     # tensor's own stride).
     moe_gguf_gate_up_rows: tuple[int, ...] | None = None
     moe_gguf_down_rows: tuple[int, ...] | None = None
+    # Native-GGUF DENSE tensors: ((role, per-layer ggml type), ...) read from the
+    # tensor table at parse time. The model-module swap runs from the ModelConfig
+    # alone, so the types have to travel with it; -1 means the role has no tensor on
+    # that layer (or its fused parts disagree), which falls back to bf16.
+    dense_gguf_types: tuple[tuple[str, tuple[int, ...]], ...] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
