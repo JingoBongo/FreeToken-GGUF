@@ -21,7 +21,11 @@ from freetoken.models.gguf.dequant import (
     GGML_F16,
     GGML_F32,
     GGML_NAME,
+    GGML_Q2_K,
+    GGML_Q3_K,
     GGML_Q4_0,
+    GGML_Q4_K,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,8 +36,11 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_KQUANTS = {GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q8_0} | _KQUANTS
+_MMQ = {GGML_Q4_0, GGML_Q8_0} | _KQUANTS
+# _DEQUANT is the fallback for types with no MMVQ/MMQ kernel; keep it as the
+# original narrow set (everything above is covered by a real kernel).
 _DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).

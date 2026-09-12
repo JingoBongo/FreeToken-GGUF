@@ -23,6 +23,10 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q2_K = 10
+GGML_Q3_K = 11
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +37,12 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    # K-quants: 256-elem super-blocks. Byte counts are ggml-common.h block_q*_K
+    # sizeof() and were cross-checked against real tensors in a Q4_K_M GGUF.
+    GGML_Q2_K: (256, 84),
+    GGML_Q3_K: (256, 110),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +52,10 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q2_K: "Q2_K",
+    GGML_Q3_K: "Q3_K",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -115,8 +129,83 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8 quants; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
+def _k_scales_mins(sb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The 12 packed 6-bit scale/min bytes of a Q4_K/Q5_K super-block -> 8 scales + 8 mins.
+
+    Vectorized ``get_scale_min_k4``: sub-blocks 0-3 keep scale and min in the low 6 bits
+    of bytes 0-3 and 4-7; sub-blocks 4-7 take the low nibble of bytes 8-11 for the scale
+    and the high nibble for the min, each with the top 2 bits borrowed from bytes 0-3
+    (scale) and 4-7 (min).
+    """
+    q = sb.contiguous().to(torch.int32)                       # [n,12]
+    lo_d = q[:, 0:4] & 63
+    lo_m = q[:, 4:8] & 63
+    hi_d = (q[:, 8:12] & 0x0F) | ((q[:, 0:4] >> 6) << 4)
+    hi_m = (q[:, 8:12] >> 4) | ((q[:, 4:8] >> 6) << 4)
+    sc = torch.cat([lo_d, hi_d], dim=1).to(torch.float32)     # [n,8]
+    mn = torch.cat([lo_m, hi_m], dim=1).to(torch.float32)     # [n,8]
+    return sc, mn
+
+
+def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_K: 256-elem super-block = fp16 ``d`` + fp16 ``dmin`` + 12 scale bytes + 128
+    nibble bytes. Four 64-elem groups; within a group the low nibbles come first (scale
+    pair ``2g``) and the high nibbles second (``2g+1``); ``w = d*sc*q - dmin*m``."""
+    raw = raw.reshape(-1, 144)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)                                # [n,1]
+    dmin = _f16_scales(raw, 2, 4)                             # [n,1]
+    sc, mn = _k_scales_mins(raw[:, 4:16])
+    qs = raw[:, 16:144].contiguous().reshape(n, 4, 32).to(torch.int32)
+    lo = (qs & 0x0F).to(torch.float32)
+    hi = (qs >> 4).to(torch.float32)
+    d1 = (d * sc[:, 0::2]).unsqueeze(-1)                      # [n,4,1]
+    m1 = (dmin * mn[:, 0::2]).unsqueeze(-1)
+    d2 = (d * sc[:, 1::2]).unsqueeze(-1)
+    m2 = (dmin * mn[:, 1::2]).unsqueeze(-1)
+    y = torch.empty((n, 4, 64), dtype=torch.float32, device=raw.device)
+    y[:, :, 0:32] = lo * d1 - m1
+    y[:, :, 32:64] = hi * d2 - m2
+    return y.reshape(-1).to(out_dtype)
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q5_K: Q4_K plus a 32-byte high-bit plane. Group ``g`` reads bit ``2g`` of
+    ``qh`` for the low-nibble half and bit ``2g+1`` for the high-nibble half (ggml's
+    ``u1``/``u2`` shifted left by two per group)."""
+    raw = raw.reshape(-1, 176)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)
+    dmin = _f16_scales(raw, 2, 4)
+    sc, mn = _k_scales_mins(raw[:, 4:16])
+    qh = raw[:, 16:48].contiguous().to(torch.int32).unsqueeze(1)          # [n,1,32]
+    ql = raw[:, 48:176].contiguous().reshape(n, 4, 32).to(torch.int32)    # [n,4,32]
+    g2 = (torch.arange(4, device=raw.device, dtype=torch.int32) * 2).view(1, 4, 1)
+    lo = ((ql & 0x0F) + (((qh >> g2) & 1) << 4)).to(torch.float32)
+    hi = ((ql >> 4) + (((qh >> (g2 + 1)) & 1) << 4)).to(torch.float32)
+    d1 = (d * sc[:, 0::2]).unsqueeze(-1)
+    m1 = (dmin * mn[:, 0::2]).unsqueeze(-1)
+    d2 = (d * sc[:, 1::2]).unsqueeze(-1)
+    m2 = (dmin * mn[:, 1::2]).unsqueeze(-1)
+    y = torch.empty((n, 4, 64), dtype=torch.float32, device=raw.device)
+    y[:, :, 0:32] = lo * d1 - m1
+    y[:, :, 32:64] = hi * d2 - m2
+    return y.reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_Q4_K: dequant_q4_k,
+    GGML_Q5_K: dequant_q5_k,
     GGML_Q6_K: dequant_q6_k,
 }
 
@@ -148,6 +237,8 @@ __all__ = [
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
+    "dequant_q4_k",
+    "dequant_q5_k",
     "dequant_q6_k",
     "dequantize",
 ]
