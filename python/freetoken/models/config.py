@@ -273,6 +273,18 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # Native-GGUF MoE only: the ggml type of each layer's fused gate_up bank and its
+    # down bank. Unsloth-Dynamic quants vary the expert type per layer while the
+    # offload cache carries ONE bank shape for all layers, so the type travels here
+    # instead of being implied by the bank.
+    moe_gguf_gate_up_types: tuple[int, ...] | None = None
+    moe_gguf_down_types: tuple[int, ...] | None = None
+    # Padded row count each layer must pass to the ggml MoE kernel so that every
+    # layer's experts land on the same per-expert byte stride despite differing
+    # types (the kernel computes expert*nrows*blocks_per_row and ignores the
+    # tensor's own stride).
+    moe_gguf_gate_up_rows: tuple[int, ...] | None = None
+    moe_gguf_down_rows: tuple[int, ...] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

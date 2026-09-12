@@ -539,6 +539,20 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, gate_up_scale, down, down_scale,
                 topk_weights, topk_ids, self.activation, self.apply_router_weight_on_input,
             )
+        if fmt == "gguf_k":
+            # Native GGUF K-quant experts: MMVQ at decode, MMQ at prefill (~3x, see
+            # fused_gguf_k for the measured numbers). gate_up and down
+            # can carry different ggml types, and the type varies per layer, so it is
+            # read off the layer (set by the model at construction).
+            from freetoken.moe.fused_gguf_k import fused_experts_gguf_k
+
+            gate_up, down = views
+            return fused_experts_gguf_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                self.gguf_gate_up_type, self.gguf_down_type,
+                self.gguf_gate_up_rows, self.gguf_down_rows,
+                self.gguf_n2, self.gguf_h, is_prefill,
+            )
         if fmt == "q4_0":
             # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
             # streamed packed banks; topk_ids already index the cache slots / layer.

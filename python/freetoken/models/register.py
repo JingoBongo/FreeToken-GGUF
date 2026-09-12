@@ -107,6 +107,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF (native K-quant) qwen35moe: same model classes as the safetensors path,
+    # GGUF config + weight loaders. Routed experts stay packed; everything dense is
+    # dequantized to bf16 at load, so no GGUF-specific layers are needed.
+    "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",

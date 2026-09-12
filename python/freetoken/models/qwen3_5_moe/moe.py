@@ -65,11 +65,23 @@ class Qwen3_5MoE(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None):
-        weight_format = (
-            "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block" else "bf16"
-        )
+        eq = getattr(config, "expert_quant", "none")
+        weight_format = "fp8_block" if eq == "fp8_block" else "bf16"
+        # Native-GGUF experts: the offload cache holds one bank shape for every layer,
+        # so this layer's own ggml types ride on the layer instead of the bank.
+        extra = None
+        if eq == "gguf_k" and layer_id is not None:
+            extra = {
+                "gguf_gate_up_type": config.moe_gguf_gate_up_types[layer_id],
+                "gguf_down_type": config.moe_gguf_down_types[layer_id],
+                "gguf_gate_up_rows": config.moe_gguf_gate_up_rows[layer_id],
+                "gguf_down_rows": config.moe_gguf_down_rows[layer_id],
+                "gguf_n2": 2 * config.moe_intermediate_size,
+                "gguf_h": config.hidden_size,
+            }
         self.experts = make_moe_layer(
-            config, layer_id=layer_id, renormalize=True, weight_format=weight_format
+            config, layer_id=layer_id, renormalize=True, weight_format=weight_format,
+            extra_attrs=extra,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.shared_expert = _SharedExpert(

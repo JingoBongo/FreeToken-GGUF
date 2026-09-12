@@ -293,12 +293,37 @@ def _model_setup_override(model_config):
         return None
 
 
+def _gguf_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf_k: GGUF is a single packed file"
+        )
+    from freetoken.models.qwen3_5_moe import (
+        dummy_gguf_k_expert_sources,
+        load_gguf_k_expert_sources,
+    )
+
+    # Native GGUF K-quant routed experts: packed block bytes streamed to the GPU and
+    # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy).
+    sink = None if dummy else layer_sink
+    sources = (
+        dummy_gguf_k_expert_sources(model_config)
+        if dummy
+        else load_gguf_k_expert_sources(model_path, model_config, layer_sink=sink)
+    )
+    return ExpertBanks(
+        "gguf_k", {name: sources[name] for name in _BANK_SCHEMAS["gguf_k"]},
+        streamed=sink is not None,
+    )
+
+
 # ModelConfig.expert_quant -> provider
 _PROVIDERS = {
     "none": _bf16_banks,
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "gguf_k": _gguf_k_banks,
 }
 
 
