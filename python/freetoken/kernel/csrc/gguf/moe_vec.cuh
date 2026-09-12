@@ -21,6 +21,19 @@ static __global__ void moe_vec_q(
     return;
   }
 
+  /* FT-MOE-VEC-NEGSKIP: a negative expert id means "this route is not mine" --
+     the hybrid backend marks the routes it hands to the CPU executor that way.
+     `moe.cuh` (MMQ) already guards it; this GEMV did not, so callers had to
+     clamp to slot 0 and cancel the result with a zero weight, which computes a
+     whole expert for nothing and -- when the slot holds another layer's expert
+     under a different ggml type -- reads arbitrary bytes as fp16 block scales
+     and returns NaN, which no zero weight can cancel. `dst` is zero-filled by
+     the caller (torch::zeros), so returning leaves the arithmetically right
+     value. Inert for every pre-existing caller: none passes a negative id. */
+  if (expert < 0) {
+    return;
+  }
+
   const int blocks_per_row = ncols / qk;
   const int blocks_per_warp = vdr * WARP_SIZE / qi;
 

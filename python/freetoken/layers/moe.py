@@ -194,6 +194,16 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(final_hidden_states)
 
 
+# FT-HYBRID-NEGSKIP-SET. Expert formats whose DECODE kernel skips a negative expert
+# id (see moe_vec.cuh's FT-MOE-VEC-NEGSKIP). For these, hybrid decode hands the GEMV
+# the CPU-owned routes as -1 instead of clamping them onto slot 0: the GPU then skips
+# that work entirely, and -- decisive for native-GGUF banks, whose ggml type varies
+# per layer while the slot cache is one pool for all of them -- never parses another
+# layer's expert under this layer's block layout, which yields NaN scales that a zero
+# router weight cannot cancel.
+_NEG_ID_SKIP_FORMATS = frozenset({"gguf_k"})
+
+
 class OffloadMoELayer(MoELayer):
     def __init__(
         self,
@@ -356,7 +366,14 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+        # FT-HYBRID-NEGSKIP-USE: formats whose GEMV guards it take the ids unclamped,
+        # so
+        # the CPU's routes are skipped rather than computed against slot 0 and
+        # zero-weighted (see _NEG_ID_SKIP_FORMATS).
+        gpu_slots = (
+            topk_ids if cache.quant_format in _NEG_ID_SKIP_FORMATS
+            else topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+        )
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
