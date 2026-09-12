@@ -96,21 +96,32 @@ static __device__ __forceinline__ void moe_q(
         }
       }
 
-      if (threadIdx.x < n_per_r / QK8_1) {
+      /* FT-MOE-DS: fill tile_y_ds for ALL mmq_x columns, not just the first nwarps.
+         The original store indexed the tile by threadIdx.y, which covers the tile only
+         when mmq_x == nwarps (vLLM's hard-coded 4x32x4). Same strided walk as
+         mul_mat_q's in mmq.cuh, with the column mapped through sorted_token_ids. */
+#pragma unroll
+      for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+        const int ids =
+            (ids0 + threadIdx.y * QI8_1 + threadIdx.x / (WARP_SIZE_GGUF / QI8_1)) % mmq_x;
         const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
+        const int col_y_eff = sorted_token_ids[col_dst_0 + ids] / top_k;
         const int block_x = ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
+        half2* dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF / QI8_1) + kby];
 
         if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
           const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
-          half2* dsi_dst = &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
-
           if (need_sum) {
             *dsi_dst = *dsi_src;
           } else {
             float* dfi_dst = (float*)dsi_dst;
             *dfi_dst = __low2float(*dsi_src);
           }
+        } else if (need_sum) {
+          *dsi_dst = __float2half2_rn(0.0f);
+        } else {
+          float* dfi_dst = (float*)dsi_dst;
+          *dfi_dst = 0.0f;
         }
       }
       __syncthreads();
