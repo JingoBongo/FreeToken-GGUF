@@ -162,17 +162,24 @@ static __device__ __forceinline__ void moe_q(
 #if defined(USE_ROCM)
 #define MOE_X_Q4_0 8
 #define MOE_Y_Q4_0 128
-#define NWARPS_Q4_0 8
+#define MOE_NWARPS_Q4_0 8
 #else
-#define MOE_X_Q4_0 4
-#define MOE_Y_Q4_0 32
-#define NWARPS_Q4_0 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q4_0
+#define MOE_X_Q4_0 32
+#endif
+#ifndef MOE_Y_Q4_0
+#define MOE_Y_Q4_0 128
+#endif
+#ifndef MOE_NWARPS_Q4_0
+#define MOE_NWARPS_Q4_0 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q4_0, 2)
 #endif
     moe_q4_0(
         const void* __restrict__ vx,
@@ -190,7 +197,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_0, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q4_0;
   const int mmq_y = MOE_Y_Q4_0;
-  const int nwarps = NWARPS_Q4_0;
+  const int nwarps = MOE_NWARPS_Q4_0;
 
   moe_q<
       scalar_t,
@@ -240,7 +247,7 @@ static void ggml_moe_q4_0_q8_1_cuda(
     cudaStream_t stream) {
   int mmq_x = MOE_X_Q4_0;
   int mmq_y = MOE_Y_Q4_0;
-  int nwarps = NWARPS_Q4_0;
+  int nwarps = MOE_NWARPS_Q4_0;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -285,17 +292,24 @@ static void ggml_moe_q4_0_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q4_1 8
 #define MOE_Y_Q4_1 128
-#define NWARPS_Q4_1 8
+#define MOE_NWARPS_Q4_1 8
 #else
-#define MOE_X_Q4_1 4
-#define MOE_Y_Q4_1 32
-#define NWARPS_Q4_1 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q4_1
+#define MOE_X_Q4_1 32
+#endif
+#ifndef MOE_Y_Q4_1
+#define MOE_Y_Q4_1 128
+#endif
+#ifndef MOE_NWARPS_Q4_1
+#define MOE_NWARPS_Q4_1 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q4_1, 2)
 #endif
     moe_q4_1(
         const void* __restrict__ vx,
@@ -313,7 +327,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_1, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q4_1;
   const int mmq_y = MOE_Y_Q4_1;
-  const int nwarps = NWARPS_Q4_1;
+  const int nwarps = MOE_NWARPS_Q4_1;
 
   moe_q<
       scalar_t,
@@ -363,7 +377,7 @@ static void ggml_moe_q4_1_q8_1_cuda(
     cudaStream_t stream) {
   int mmq_x = MOE_X_Q4_1;
   int mmq_y = MOE_Y_Q4_1;
-  int nwarps = NWARPS_Q4_1;
+  int nwarps = MOE_NWARPS_Q4_1;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -408,17 +422,24 @@ static void ggml_moe_q4_1_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q5_0 8
 #define MOE_Y_Q5_0 128
-#define NWARPS_Q5_0 8
+#define MOE_NWARPS_Q5_0 8
 #else
-#define MOE_X_Q5_0 4
-#define MOE_Y_Q5_0 32
-#define NWARPS_Q5_0 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q5_0
+#define MOE_X_Q5_0 32
+#endif
+#ifndef MOE_Y_Q5_0
+#define MOE_Y_Q5_0 128
+#endif
+#ifndef MOE_NWARPS_Q5_0
+#define MOE_NWARPS_Q5_0 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q5_0, 2)
 #endif
     moe_q5_0(
         const void* __restrict__ vx,
@@ -436,7 +457,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_0, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q5_0;
   const int mmq_y = MOE_Y_Q5_0;
-  const int nwarps = NWARPS_Q5_0;
+  const int nwarps = MOE_NWARPS_Q5_0;
 
   moe_q<
       scalar_t,
@@ -486,7 +507,7 @@ static void ggml_moe_q5_0_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_0;
   const int mmq_y = MOE_Y_Q5_0;
-  const int nwarps = NWARPS_Q5_0;
+  const int nwarps = MOE_NWARPS_Q5_0;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -531,17 +552,24 @@ static void ggml_moe_q5_0_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q5_1 8
 #define MOE_Y_Q5_1 128
-#define NWARPS_Q5_1 8
+#define MOE_NWARPS_Q5_1 8
 #else
-#define MOE_X_Q5_1 4
-#define MOE_Y_Q5_1 32
-#define NWARPS_Q5_1 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q5_1
+#define MOE_X_Q5_1 32
+#endif
+#ifndef MOE_Y_Q5_1
+#define MOE_Y_Q5_1 128
+#endif
+#ifndef MOE_NWARPS_Q5_1
+#define MOE_NWARPS_Q5_1 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q5_1, 2)
 #endif
     moe_q5_1(
         const void* __restrict__ vx,
@@ -559,7 +587,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_1, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q5_1;
   const int mmq_y = MOE_Y_Q5_1;
-  const int nwarps = NWARPS_Q5_1;
+  const int nwarps = MOE_NWARPS_Q5_1;
 
   moe_q<
       scalar_t,
@@ -609,7 +637,7 @@ static void ggml_moe_q5_1_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_1;
   const int mmq_y = MOE_Y_Q5_1;
-  const int nwarps = NWARPS_Q5_1;
+  const int nwarps = MOE_NWARPS_Q5_1;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -654,17 +682,24 @@ static void ggml_moe_q5_1_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q8_0 8
 #define MOE_Y_Q8_0 128
-#define NWARPS_Q8_0 8
+#define MOE_NWARPS_Q8_0 8
 #else
-#define MOE_X_Q8_0 4
-#define MOE_Y_Q8_0 32
-#define NWARPS_Q8_0 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q8_0
+#define MOE_X_Q8_0 32
+#endif
+#ifndef MOE_Y_Q8_0
+#define MOE_Y_Q8_0 128
+#endif
+#ifndef MOE_NWARPS_Q8_0
+#define MOE_NWARPS_Q8_0 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q8_0, 2)
 #endif
     moe_q8_0(
         const void* __restrict__ vx,
@@ -682,7 +717,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
-  const int nwarps = NWARPS_Q8_0;
+  const int nwarps = MOE_NWARPS_Q8_0;
 
   moe_q<
       scalar_t,
@@ -732,7 +767,7 @@ static void ggml_moe_q8_0_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
-  const int nwarps = NWARPS_Q8_0;
+  const int nwarps = MOE_NWARPS_Q8_0;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -777,17 +812,24 @@ static void ggml_moe_q8_0_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q2_K 8
 #define MOE_Y_Q2_K 128
-#define NWARPS_Q2_K 8
+#define MOE_NWARPS_Q2_K 8
 #else
-#define MOE_X_Q2_K 4
-#define MOE_Y_Q2_K 32
-#define NWARPS_Q2_K 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q2_K
+#define MOE_X_Q2_K 32
+#endif
+#ifndef MOE_Y_Q2_K
+#define MOE_Y_Q2_K 128
+#endif
+#ifndef MOE_NWARPS_Q2_K
+#define MOE_NWARPS_Q2_K 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q2_K, 2)
 #endif
     moe_q2_K(
         const void* __restrict__ vx,
@@ -805,7 +847,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q2_K;
   const int mmq_y = MOE_Y_Q2_K;
-  const int nwarps = NWARPS_Q2_K;
+  const int nwarps = MOE_NWARPS_Q2_K;
 
   moe_q<
       scalar_t,
@@ -855,7 +897,7 @@ static void ggml_moe_q2_K_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q2_K;
   const int mmq_y = MOE_Y_Q2_K;
-  const int nwarps = NWARPS_Q2_K;
+  const int nwarps = MOE_NWARPS_Q2_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -900,17 +942,24 @@ static void ggml_moe_q2_K_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q3_K 8
 #define MOE_Y_Q3_K 128
-#define NWARPS_Q3_K 8
+#define MOE_NWARPS_Q3_K 8
 #else
-#define MOE_X_Q3_K 4
-#define MOE_Y_Q3_K 32
-#define NWARPS_Q3_K 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q3_K
+#define MOE_X_Q3_K 32
+#endif
+#ifndef MOE_Y_Q3_K
+#define MOE_Y_Q3_K 128
+#endif
+#ifndef MOE_NWARPS_Q3_K
+#define MOE_NWARPS_Q3_K 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q3_K, 2)
 #endif
     moe_q3_K(
         const void* __restrict__ vx,
@@ -929,7 +978,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q3_K, 2)
 
   const int mmq_x = MOE_X_Q3_K;
   const int mmq_y = MOE_Y_Q3_K;
-  const int nwarps = NWARPS_Q3_K;
+  const int nwarps = MOE_NWARPS_Q3_K;
 
   moe_q<
       scalar_t,
@@ -978,7 +1027,7 @@ static void ggml_moe_q3_K_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q3_K;
   const int mmq_y = MOE_Y_Q3_K;
-  const int nwarps = NWARPS_Q3_K;
+  const int nwarps = MOE_NWARPS_Q3_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -1023,17 +1072,24 @@ static void ggml_moe_q3_K_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q4_K 8
 #define MOE_Y_Q4_K 128
-#define NWARPS_Q4_K 8
+#define MOE_NWARPS_Q4_K 8
 #else
-#define MOE_X_Q4_K 4
-#define MOE_Y_Q4_K 32
-#define NWARPS_Q4_K 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q4_K
+#define MOE_X_Q4_K 32
+#endif
+#ifndef MOE_Y_Q4_K
+#define MOE_Y_Q4_K 128
+#endif
+#ifndef MOE_NWARPS_Q4_K
+#define MOE_NWARPS_Q4_K 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q4_K, 2)
 #endif
     moe_q4_K(
         const void* __restrict__ vx,
@@ -1051,7 +1107,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q4_K, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q4_K;
   const int mmq_y = MOE_Y_Q4_K;
-  const int nwarps = NWARPS_Q4_K;
+  const int nwarps = MOE_NWARPS_Q4_K;
 
   moe_q<
       scalar_t,
@@ -1101,7 +1157,7 @@ static void ggml_moe_q4_K_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q4_K;
   const int mmq_y = MOE_Y_Q4_K;
-  const int nwarps = NWARPS_Q4_K;
+  const int nwarps = MOE_NWARPS_Q4_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -1146,17 +1202,24 @@ static void ggml_moe_q4_K_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q5_K 8
 #define MOE_Y_Q5_K 128
-#define NWARPS_Q5_K 8
+#define MOE_NWARPS_Q5_K 8
 #else
-#define MOE_X_Q5_K 4
-#define MOE_Y_Q5_K 32
-#define NWARPS_Q5_K 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q5_K
+#define MOE_X_Q5_K 32
+#endif
+#ifndef MOE_Y_Q5_K
+#define MOE_Y_Q5_K 128
+#endif
+#ifndef MOE_NWARPS_Q5_K
+#define MOE_NWARPS_Q5_K 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q5_K, 2)
 #endif
     moe_q5_K(
         const void* __restrict__ vx,
@@ -1174,7 +1237,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q5_K, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q5_K;
   const int mmq_y = MOE_Y_Q5_K;
-  const int nwarps = NWARPS_Q5_K;
+  const int nwarps = MOE_NWARPS_Q5_K;
 
   moe_q<
       scalar_t,
@@ -1224,7 +1287,7 @@ static void ggml_moe_q5_K_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q5_K;
   const int mmq_y = MOE_Y_Q5_K;
-  const int nwarps = NWARPS_Q5_K;
+  const int nwarps = MOE_NWARPS_Q5_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
@@ -1269,17 +1332,24 @@ static void ggml_moe_q5_K_q8_1_cuda(
 #if defined(USE_ROCM)
 #define MOE_X_Q6_K 8
 #define MOE_Y_Q6_K 128
-#define NWARPS_Q6_K 8
+#define MOE_NWARPS_Q6_K 8
 #else
-#define MOE_X_Q6_K 4
-#define MOE_Y_Q6_K 32
-#define NWARPS_Q6_K 4
+/* FT-MMQ-TILES */
+#ifndef MOE_X_Q6_K
+#define MOE_X_Q6_K 32
+#endif
+#ifndef MOE_Y_Q6_K
+#define MOE_Y_Q6_K 128
+#endif
+#ifndef MOE_NWARPS_Q6_K
+#define MOE_NWARPS_Q6_K 4
+#endif
 #endif
 
 template <typename scalar_t, bool need_check>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* MOE_NWARPS_Q6_K, 2)
 #endif
     moe_q6_K(
         const void* __restrict__ vx,
@@ -1297,7 +1367,7 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q6_K, 2)
         const int top_k) {
   const int mmq_x = MOE_X_Q6_K;
   const int mmq_y = MOE_Y_Q6_K;
-  const int nwarps = NWARPS_Q6_K;
+  const int nwarps = MOE_NWARPS_Q6_K;
 
   moe_q<
       scalar_t,
@@ -1347,7 +1417,7 @@ static void ggml_moe_q6_K_q8_1_cuda(
     cudaStream_t stream) {
   const int mmq_x = MOE_X_Q6_K;
   const int mmq_y = MOE_Y_Q6_K;
-  const int nwarps = NWARPS_Q6_K;
+  const int nwarps = MOE_NWARPS_Q6_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
