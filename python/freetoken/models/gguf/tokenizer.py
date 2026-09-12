@@ -19,6 +19,52 @@ from .reader import gguf_architecture, load_gguf_metadata
 _TOKENIZER_ARCH = {"gemma4": "gemma4_text", "qwen35moe": "qwen3_moe"}
 
 
+def _register_user_defined(fast, tok_dict: dict) -> tuple[int, int]:
+    """Make the GGUF CONTROL (type 3) and USER_DEFINED (type 4) tokens match verbatim.
+
+    transformers' GGUF converter registers only the handful it is told about by name, so
+    the rest -- ``<think>``/``</think>``/``<tool_call>``/``</tool_call>``, which the chat
+    template writes as literal text, and the vision/fim control markers -- were BPE-split
+    into ordinary pieces instead of their real ids.
+
+    CONTROL goes in as ``special=True`` (a marker should disappear under
+    ``skip_special_tokens``), USER_DEFINED as ``special=False`` (the reasoning and
+    tool-call parsers read those tags out of the decoded text). Returns the counts.
+    """
+    from tokenizers import AddedToken
+
+    tokens = tok_dict.get("tokens") or []
+    ttypes = tok_dict.get("token_type") or []
+    if not tokens or len(ttypes) != len(tokens):
+        return 0, 0
+    vocab = fast.get_vocab()
+    want = {True: [], False: []}
+    for tid, (text, tt) in enumerate(zip(tokens, ttypes)):
+        tt = int(tt)
+        if tt not in (3, 4):
+            continue
+        # Only tokens already in the vocab at their own id: add_tokens would otherwise
+        # APPEND a new id past the embedding table and corrupt every later encode.
+        if vocab.get(text) != tid:
+            continue
+        if len(fast.encode(text, add_special_tokens=False).ids) == 1:
+            continue  # already matches verbatim
+        want[tt == 3].append(AddedToken(text, normalized=False, special=(tt == 3)))
+    if not (want[True] or want[False]):
+        return 0, 0
+    before = fast.get_vocab_size(with_added_tokens=True)
+    if want[True]:
+        fast.add_special_tokens(want[True])
+    if want[False]:
+        fast.add_tokens(want[False])
+    after = fast.get_vocab_size(with_added_tokens=True)
+    assert after == before, (
+        "registering GGUF special tokens grew the vocab %d -> %d; they must map to their "
+        "existing ids" % (before, after)
+    )
+    return len(want[True]), len(want[False])
+
+
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
@@ -32,6 +78,7 @@ def load_gguf_tokenizer(model_path: str):
         if k.startswith("tokenizer.ggml.")
     }
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+    _register_user_defined(fast, tok_dict)
 
     tokens = tok_dict["tokens"]
 
