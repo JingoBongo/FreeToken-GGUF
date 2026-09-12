@@ -71,6 +71,14 @@ model that does not fit, and every number above is a 12 GB-GPU number.
 * stability: 56-request mixed stress (tiny prompts, ~4600-token prompts crossing the
   chunk boundary, prefix-cache hits) with zero crashes, twice, on the configuration that
   used to die at request 15.
+* **this branch's own source, executed.** The measurements above were taken with the
+  patch applied in place; this branch additionally lifts `sanitize_moe_align_tail()` out
+  of `_mmq_align` into `kernel/triton/moe_align.py`, so commit 1 stands alone. That
+  refactor was then installed into the venv and run: Cyber-Tiel-Coder-35B-A3B Q4_K_M at
+  ctx 131072 measured **decode 52.7 tok/s (best 53.4) / prefill 1585 tok/s**, against
+  53.3 (53.9) / 1588 for the in-place patch — run-to-run noise — with smoke 5/5,
+  stress 56/56 and a 66.9k-token prompt served. The branch is not just diff-equivalent
+  to what was benchmarked; it is what ran.
 
 **Not verified:**
 
