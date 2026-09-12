@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This is a fork.** It adds native **GGUF** serving for Qwen3.5/3.6-class MoE
+> checkpoints (packed K-quant expert banks, no requantization), plus four bug fixes to
+> the vendored ggml/MMQ kernels that apply to upstream too.
+> **See [README-fork.md](README-fork.md)** for what it changes, measured numbers, and how
+> to run it. Everything below is upstream's own README, unchanged.
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">

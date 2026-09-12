@@ -5,7 +5,37 @@ Qwen3.5/3.6-class MoE **GGUF** checkpoint natively — the expert banks and most
 dense tensors stay in their packed ggml blocks from disk to kernel, and are never
 materialized as bf16.
 
-Upstream's own `README.md` is unchanged; this file only describes what the fork adds.
+---
+
+## Why this exists
+
+FreeToken loads Hugging Face **safetensors**. Its GGUF path exists but covers one
+architecture (`gemma4`) and one expert quantization (`Q4_0`), so a `qwen35moe` GGUF is
+simply refused.
+
+That is a problem because GGUF is the format the community actually ships in. Most
+fine-tunes, abliterations and Unsloth-Dynamic quants exist **only** as GGUF — there is no
+safetensors original to convert from. The usual answers are both bad:
+
+* **Requantize to a supported format.** You cannot: the safetensors ancestor does not
+  exist, and going GGUF → bf16 → NVFP4 means decoding someone's imatrix-weighted
+  quantization and re-quantizing it with a different error model. You would be serving a
+  lossy copy of a lossy copy, and the fine-tune's whole point is what those weights say.
+* **Use llama.cpp instead.** Reasonable, but then you give up this engine's expert cache,
+  its hybrid CPU/PCIe miss handling and its OpenAI/Anthropic server.
+
+So this fork teaches the engine to read the checkpoint **as it is**: routed experts stay
+in their native ggml blocks (`Q4_K`/`Q5_K`/`Q6_K`, per-layer mixed, as Dynamic quants
+emit them) from disk all the way into the kernels. Nothing is requantized, so the
+imatrix baked into those weights is preserved exactly.
+
+Getting it to load was the easy half. Naively adapted it ran at **27.4 tok/s**, well
+under llama.cpp on the same box. Most of the commits here are the other half — and three
+of the four bug fixes are in code inherited from vLLM/sgl-kernel, so they are worth
+reading even if you never touch GGUF.
+
+Upstream's own `README.md` is otherwise unchanged; this file only describes what the fork
+adds.
 
 ---
 
@@ -24,6 +54,51 @@ code that also exists in sgl-kernel and vLLM:
 | 5–9 | `feat` | The GGUF work proper: K-quant type metadata, the `qwen35moe` adapter and its packed-bank MoE kernels, packed dense weights, an expert-bank stride taken from the tensor, and K-quant CPU dot products that make `--moe-backend hybrid` reachable. |
 | 10 | `fix(gguf)` | The GGUF tokenizer registered 3 of 27 CONTROL tokens and no USER_DEFINED ones, so `<think>` tokenized as `['<th', 'ink', '>']` — silently degrading **every** Qwen3.5/3.6 chat prompt. |
 | 11–12 | `feat` | A sweepable hybrid fetch fraction, and opt-in decode-step profiling. |
+
+---
+
+## Running it
+
+Install **from this tree**, not from PyPI. `setup.py` builds `freetoken.kernel._cpu_moe`
+from `cpu_moe_ext.cpp`, and that is where the K-quant CPU kernels live — a wheel install
+would give you upstream's prebuilt `.so`, and `--moe-backend cpu/hybrid` would then refuse
+`gguf_k` rather than compute it wrongly.
+
+```bash
+git clone -b feat/qwen35moe-gguf <this-fork> && cd FreeToken
+uv venv && source .venv/bin/activate
+uv pip install -e ".[accel]"
+```
+
+Requirements are upstream's ([docs/install.md](docs/install.md)): Linux x86_64, NVIDIA
+Ampere or newer, driver r580+ (CUDA 13), `nvcc` on PATH. The CUDA kernels JIT-compile on
+first start — expect a few minutes once, then a cache.
+
+Point `--model` at the `.gguf` **file** (not a directory, as with safetensors):
+
+```bash
+ft serve   --model ~/models/Cyber-Tiel-Coder-35B-A3B-UD-Q4_K_M.gguf   --served-model-name cyber-tiel-coder   --num-tokens 131072   --moe-backend hybrid   --moe-cache-size 2710   --max-running-requests 1   --memory-ratio 0.93   --max-prefill-length 2048
+```
+
+Then it is upstream's server ([docs/quickstart.md](docs/quickstart.md)): OpenAI and
+Anthropic APIs, `ft shell`, `ft launch <agent>`.
+
+Four of those flags are not cosmetic:
+
+| flag | why |
+|---|---|
+| `--max-prefill-length 2048` | **Load-bearing.** At the default the GDN prefill kernel asks for a transient that is not there and the OOM kills the whole service, not just the request. |
+| `--moe-backend hybrid` | The reason commit 9 exists. `auto` resolves to `offload` and leaves the CPU idle; `fused` is refused (the experts do not fit); `cpu` alone measures far worse — a whole layer on CPU is ~0.8 ms against 0.085 ms on the GPU. |
+| `--moe-cache-size` | Tune it: take the largest value that survives load, then step down one. Smoke tests are **not** a sufficient gate — a cache 140 slots too large starts, answers five prompts and dies under concurrency. |
+| `--memory-ratio 0.93` | 0.95 leaves ~0.1 GiB free and dies mid-benchmark on this card. |
+
+`FREETOKEN_HYBRID_FETCH_FRACTION` (commit 11) overrides the profiled PCIe/CPU split; the
+benched value systematically over-fetches here (0.28 measured against 0.337 profiled).
+Sweep it per checkpoint — it is worth a few percent and costs one restart per point.
+
+**Quantizations handled:** `Q2_K`–`Q6_K`, `Q4_0`, `Q8_0`, including per-layer mixes
+(Unsloth-Dynamic `UD-*` checkpoints vary the type per layer, which is why the expert-bank
+stride comes from the tensor). **IQ-quants are not supported** — see limitations.
 
 ---
 
