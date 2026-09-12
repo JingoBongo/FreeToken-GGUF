@@ -325,4 +325,74 @@ def moe_align_block_size(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
-__all__ = ["moe_align_block_size"]
+# --------------------------------------------------------------------------------------
+# Making the unwritten tail safe for the ggml MMQ kernels
+# --------------------------------------------------------------------------------------
+
+_TAIL_RAMP_CACHE: dict = {}
+
+
+def _tail_ramp(n: int, device: torch.device, step: int = 1) -> torch.Tensor:
+    """Cached ``[0, step, 2*step, ...]`` int32 ramp of length ``n``.
+
+    Re-created on every MoE layer of every prefill chunk otherwise.
+    """
+    key = (int(n), int(step), device.type, device.index)
+    ramp = _TAIL_RAMP_CACHE.get(key)
+    if ramp is None:
+        ramp = torch.arange(0, n * step, step, device=device, dtype=torch.int32)
+        _TAIL_RAMP_CACHE[key] = ramp
+    return ramp
+
+
+def sanitize_moe_align_tail(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    block_size: int,
+    sentinel: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Make the region past ``num_tokens_post_pad`` inert for a grouped MMQ kernel.
+
+    ``moe_align_block_size`` -- this one, the vendored sgl/CUDA one, and vLLM's --
+    allocates ``sorted_token_ids`` and ``expert_ids`` with ``torch.empty`` and only
+    writes the region the routing actually uses. ``ggml_moe_a8`` (csrc/gguf/moe.cuh),
+    however, launches ``floor(len(sorted_token_ids) / mmq_x)`` column blocks, which
+    reaches PAST ``num_tokens_post_pad``, and guards those blocks only with::
+
+        const int exp_idx = expert_ids[blockIdx.y];
+        if (exp_idx > 255 || exp_idx < 0) return;   // passes for a recycled id in [0,255]
+        ...
+        if (col_y_eff < ncols_y) { ... y[col_y_eff * blocks_per_col_y + block_x] ... }
+        ...
+        const int col_dst = token_offs[j / nwarps];
+        if (col_dst >= ncols_dst) return;           // false for a NEGATIVE offset
+        dst[col_dst * nrows_dst + row_dst] = ...;   // out-of-bounds WRITE
+
+    Neither guard rejects a *negative* token offset: ``col_y_eff < ncols_y`` is true for
+    a negative, so the quantized activations are read out of bounds, and
+    ``col_dst >= ncols_dst`` is false for a negative, so the epilogue writes out of
+    bounds. Freshly mapped device memory is usually benign, which is why a short
+    benchmark or an isolated kernel sweep never sees it; in a long-running server the
+    caching allocator hands back recycled pages and the kernel eventually faults.
+
+    So: sentinel-fill the token offsets past ``num_tokens_post_pad`` (the epilogue
+    already returns on ``col_dst >= ncols_dst``, and ``sentinel`` should be
+    ``ncols_dst``) and set the unused ``expert_ids`` to -1 (the kernel returns on a
+    negative expert id *before* it ever reads an offset).
+
+    Both masks compare against the ``num_tokens_post_pad`` **device** tensor, so nothing
+    here synchronizes, and the ramps are cached per (length, step, device) so it adds no
+    allocator churn.
+
+    ``benchmarks/gguf_moe_mmq_poison_repro.py`` is the deterministic reproducer.
+    """
+    npp = num_tokens_post_pad.to(torch.int32)
+    pos = _tail_ramp(sorted_token_ids.numel(), sorted_token_ids.device)
+    sorted_token_ids = torch.where(pos < npp, sorted_token_ids, sentinel)
+    blk_pos = _tail_ramp(expert_ids.numel(), expert_ids.device, block_size)
+    expert_ids = torch.where(blk_pos < npp, expert_ids, -1)
+    return sorted_token_ids, expert_ids
+
+
+__all__ = ["moe_align_block_size", "sanitize_moe_align_tail"]
