@@ -610,6 +610,26 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
+        # FT-HYBRID-FRACTION: FREETOKEN_HYBRID_FETCH_FRACTION overrides the benched
+        # split. The profile's number is a bandwidth ratio measured in isolation;
+        # the real optimum also carries the PCIe latency the GPU hides and the DRAM
+        # contention between the gather and the CPU GEMV, so it is worth sweeping
+        # once per model. Measured here (Cyber-Tiel-Coder UD-Q4_K_M, 3750 slots,
+        # 5 CPU workers): benched 0.337 -> 56.1 tok/s, 0.31 -> 57.6, 0.28 -> 57.7,
+        # 0.25 -> 57.5, 0.22 -> 56.5, 0.18 -> 53.4, 0.42 -> 55.5, 0.55 -> 49.3.
+        # Use --moe-hybrid-max-fetch 0 for "never fetch"; 0.0 here means "fall back
+        # to the cap", which is the whole-layer fetch.
+        env_fraction = os.environ.get("FREETOKEN_HYBRID_FETCH_FRACTION")
+        if env_fraction:
+            fraction = min(1.0, max(0.0, float(env_fraction)))
+            cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction caps
+            cache.hybrid_fetch_fraction = fraction
+            logger.info_rank0(
+                f"--moe-hybrid-max-fetch: FREETOKEN_HYBRID_FETCH_FRACTION={fraction:.3f}"
+                " of each decode step's expert misses fetched over PCIe "
+                "(overriding the benched split)"
+            )
+            return
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
