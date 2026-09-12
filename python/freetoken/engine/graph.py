@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import sys
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -17,6 +19,137 @@ if TYPE_CHECKING:
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------- FT-DECODE-PROF
+# Env-gated decode-step instrumentation. A CUDA-graph decode hides everything outside
+# the graph from ordinary host-side timing, so the replay has to be timed on the stream
+# and compared with the step period; the difference is the non-graph cost per token.
+class _DecodeProf:
+    def __init__(self, mode):
+        import collections
+        self.mode = mode
+        self.every = int(os.environ.get("FT_DECODE_PROF_EVERY", "64"))
+        self.skip = int(os.environ.get("FT_DECODE_PROF_SKIP", "48"))
+        self.nprof = int(os.environ.get("FT_DECODE_PROF_N", "48"))
+        self.out = os.environ.get(
+            "FT_DECODE_PROF_OUT", os.path.expanduser("~/freetoken-decode-prof.txt"))
+        self.n = 0
+        self.pairs = collections.deque()
+        self.prep_s = 0.0
+        self.launch_s = 0.0
+        self.period_s = 0.0
+        self.period_n = 0
+        self.last_entry = None
+        self.gpu_ms = 0.0
+        self.gpu_n = 0
+        self.prof = None
+        self.prof_done = False
+        self.prof_started_at = None
+
+    def _flush(self):
+        import torch
+        if not self.pairs:
+            return
+        torch.cuda.synchronize()
+        while self.pairs:
+            a, b = self.pairs.popleft()
+            self.gpu_ms += a.elapsed_time(b)
+            self.gpu_n += 1
+
+    def _report(self):
+        self._flush()
+        if not self.gpu_n or not self.period_n:
+            return
+        gpu = self.gpu_ms / self.gpu_n
+        period = self.period_s / self.period_n * 1e3
+        prep = self.prep_s / self.gpu_n * 1e3
+        launch = self.launch_s / self.gpu_n * 1e3
+        outside = period - gpu
+        sys.stderr.write(
+            "FT-DECODE-PROF n=%d  period %.3f ms (%.1f tok/s)  graph-replay %.3f ms (%.1f%%)"
+            "  outside-graph %.3f ms (%.1f%%)  [host prep %.3f, launch %.3f]\n"
+            % (self.gpu_n, period, 1e3 / period if period else 0.0, gpu,
+               100.0 * gpu / period if period else 0.0, outside,
+               100.0 * outside / period if period else 0.0, prep, launch))
+        sys.stderr.flush()
+        self.gpu_ms = 0.0
+        self.gpu_n = 0
+        self.period_s = 0.0
+        self.period_n = 0
+        self.prep_s = 0.0
+        self.launch_s = 0.0
+
+    def _maybe_torch_profiler(self):
+        if self.mode != "torch" or self.prof_done:
+            return
+        import torch
+        if self.prof is None and self.n == self.skip:
+            self.prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False, with_stack=False,
+            )
+            self.prof.__enter__()
+            self.prof_started_at = self.n
+            sys.stderr.write("FT-DECODE-PROF torch.profiler started at step %d\n" % self.n)
+            sys.stderr.flush()
+        elif self.prof is not None and self.n >= self.prof_started_at + self.nprof:
+            torch.cuda.synchronize()
+            self.prof.__exit__(None, None, None)
+            steps = self.n - self.prof_started_at
+            try:
+                ka = self.prof.key_averages()
+                with open(self.out, "w") as fh:
+                    fh.write("decode steps profiled: %d\n\n" % steps)
+                    fh.write(ka.table(sort_by="self_cuda_time_total", row_limit=90))
+                    fh.write("\n\n==== by cpu self time ====\n\n")
+                    fh.write(ka.table(sort_by="self_cpu_time_total", row_limit=40))
+                sys.stderr.write("FT-DECODE-PROF torch.profiler table -> %s (%d steps)\n"
+                                 % (self.out, steps))
+            except Exception as exc:  # noqa: BLE001 -- must never kill a serve
+                sys.stderr.write("FT-DECODE-PROF table failed: %r\n" % (exc,))
+            sys.stderr.flush()
+            self.prof = None
+            self.prof_done = True
+
+    def replay(self, runner, batch):
+        import time
+
+        import torch
+        now = time.perf_counter()
+        if self.last_entry is not None:
+            self.period_s += now - self.last_entry
+            self.period_n += 1
+        self.last_entry = now
+        self._maybe_torch_profiler()
+
+        runner.buffer.copy_from(batch)
+        g = runner.graph_map[batch.padded_size]
+        runner.attn_backend.prepare_for_replay(batch)
+        t1 = time.perf_counter()
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev0.record()
+        g.replay()
+        ev1.record()
+        t2 = time.perf_counter()
+        self.prep_s += t1 - now
+        self.launch_s += t2 - t1
+        self.pairs.append((ev0, ev1))
+        self.n += 1
+        if len(self.pairs) >= self.every:
+            self._report()
+        return runner.buffer.logits[: batch.size]
+
+
+_FT_DECODE_PROF_MODE = os.environ.get("FT_DECODE_PROF", "").strip().lower()
+_FT_DECODE_PROF = (
+    _DecodeProf(_FT_DECODE_PROF_MODE)
+    if _FT_DECODE_PROF_MODE in ("1", "events", "torch")
+    else None
+)
+# -------------------------------------------------------------- /FT-DECODE-PROF
 
 
 @dataclass
@@ -191,6 +324,8 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        if _FT_DECODE_PROF is not None:  # FT-DECODE-PROF
+            return _FT_DECODE_PROF.replay(self, batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
